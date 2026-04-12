@@ -1,5 +1,6 @@
 # Redir: Cross-Platform Environment Filter Wrapper
-
+- Text written by Slop-Machine
+  
 **Redir** is a high-performance, cross-platform (Windows/Linux) environment variable filter and wrapper written in C++20. It allows you to transparently wrap any executable and modify its environment variables (add, update, or remove) before execution, without modifying the original binary.
 
 ## How It Works
