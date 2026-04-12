@@ -342,9 +342,18 @@ public:
     void setupConsole() override {
         wchar_t u16Flag[4];
         if (GetEnvironmentVariableW(L"REDIR_ENABLE_U16TEXT", u16Flag, 4) > 0 && u16Flag[0] == L'1') {
-            _setmode(_fileno(stdout), _O_U16TEXT);
-            _setmode(_fileno(stderr), _O_U16TEXT);
-            _setmode(_fileno(stdin), _O_U16TEXT);
+            auto retVal = _setmode(_fileno(stdout), _O_U16TEXT);
+            if (retVal == -1) {
+                Logger::error("Fehler beim Setzen des Modus für stdout: ", GetLastError());
+            }
+            retVal = _setmode(_fileno(stderr), _O_U16TEXT);
+            if (retVal == -1) {
+                Logger::error("Fehler beim Setzen des Modus für stderr: ", GetLastError());
+            }
+            retVal = _setmode(_fileno(stdin), _O_U16TEXT);
+            if (retVal == -1) {
+                Logger::error("Fehler beim Setzen des Modus für stdin: ", GetLastError());
+            } 
         }
     }
 
