@@ -30,7 +30,15 @@
  * 100+: Perfektion. Kein One-Shot-Prompt, sondern eine echte Kooperation zwischen 
  *       Mensch und Maschine. Senior-Engineer-Approved. Müller lächelt (jetzt wirklich).
  */
- 
+
+#ifdef _WIN32
+#  define COLD
+#  define NOINLINE __declspec(noinline)
+#else
+#  define COLD     __attribute__((cold))
+#  define NOINLINE __attribute__((noinline))
+#endif 
+
 #include <iostream>
 #include <string>
 #include <vector>
@@ -100,13 +108,13 @@ public:
     enum class Level { Info, Warn, Error };
 
     template<typename... Args>
-    static void info(Args&&... args) { log(Level::Info, std::forward<Args>(args)...); }
+    NOINLINE static void info(Args&&... args) { log(Level::Info, std::forward<Args>(args)...); }
     
     template<typename... Args>
-    static void warn(Args&&... args) { log(Level::Warn, std::forward<Args>(args)...); }
+    NOINLINE COLD static void warn(Args&&... args) { log(Level::Warn, std::forward<Args>(args)...); }
     
     template<typename... Args>
-    static void error(Args&&... args) { log(Level::Error, std::forward<Args>(args)...); }
+    NOINLINE COLD static void error(Args&&... args) { log(Level::Error, std::forward<Args>(args)...); }
 
 private:
 #ifdef _WIN32
