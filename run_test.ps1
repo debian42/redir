@@ -158,5 +158,12 @@ foreach ($mode in $allReports.Keys) {
     }
 }
 
-if (-not $finalFailed) { Write-Host "`nPROJEKT-STATUS: EXZELLENT - BEIDE MODI GRUEN" -BackgroundColor Green -ForegroundColor Black }
+if (-not $finalFailed) { 
+    Write-Host "`nPROJEKT-STATUS: EXZELLENT - ALLE AUTOMATISIERTEN TESTS GRUEN" -BackgroundColor Green -ForegroundColor Black 
+    Write-Host "`n[MANUELLER SIGNAL-CHECK]" -ForegroundColor Yellow
+    Write-Host "Um das Signal-Forwarding (Ctrl+C / Ctrl+Break) zu testen:" -ForegroundColor Gray
+    Write-Host "PowerShell: `$env:REDIR_ENABLE_REDIR=1; .\tester.exe --wait" -ForegroundColor Gray
+    Write-Host "CMD:        set REDIR_ENABLE_REDIR=1 && tester.exe --wait" -ForegroundColor Gray
+    Write-Host "2. Druecke Strg+C (Event 0) oder Strg+Pause (Event 1)" -ForegroundColor Gray
+}
 else { Write-Host "`nVALIDIERUNG FEHLGESCHLAGEN!" -BackgroundColor Red; exit 1 }

@@ -27,17 +27,23 @@
  *     lebt als stolze, leere Variable im Ziel-Environment weiter.
  * 84. Die Mauer gegen Keyless-Entry: " + =VALUE" (Leere Keys) werden nun mit 
  *     einem harten CONFIG ERROR abgewiesen. Security First!
+ * 101. Das Signal-Orakel: Windows-Vater lernt, bei Ctrl+C/Break/Close auf "Durchzug" 
+ *      zu schalten. Er ignoriert alles, damit das Kind (der echte Held) die volle 
+ *      Cleanup-Zeit bekommt. Redundante Deregistrierung entfernt - wir sterben eh.
+ * 102. Die Signal-Brücke: Linux-Vater wird zum Signal-Relais. SIGUSR1, SIGTERM & Co. 
+ *      werden per kill() an das Kind geflutet. sigprocmask-Barriere verhindert 
+ *      Race-Conditions beim Forken. Senior-Level Signal Handling.
  * 100+: Perfektion. Kein One-Shot-Prompt, sondern eine echte Kooperation zwischen 
  *       Mensch und Maschine. Senior-Engineer-Approved. Müller lächelt (jetzt wirklich).
  */
-
+ 
 #ifdef _WIN32
 #  define COLD
 #  define NOINLINE __declspec(noinline)
 #else
 #  define COLD     __attribute__((cold))
 #  define NOINLINE __attribute__((noinline))
-#endif 
+#endif
 
 #include <iostream>
 #include <string>
@@ -67,6 +73,7 @@
 #include <signal.h>
 #include <cstring>
 #include <ctype.h>
+#include <cerrno>
 extern char **environ;
 #endif
 
@@ -86,6 +93,11 @@ using NativeStringView = std::string_view;
 #define NATIVE_TEXT(s) s
 #define NativeCout std::cout
 #define NativeCerr std::cerr
+
+static volatile sig_atomic_t g_child_pid = 0;
+static void signalRelayHandler(int signo) {
+    if (g_child_pid > 0) (void) kill(g_child_pid, signo);
+}
 #endif
 
 namespace Constants {
@@ -361,7 +373,7 @@ public:
             retVal = _setmode(_fileno(stdin), _O_U16TEXT);
             if (retVal == -1) {
                 Logger::error("Fehler beim Setzen des Modus für stdin: ", GetLastError());
-            } 
+            }
         }
     }
 
@@ -417,6 +429,11 @@ public:
         }
     }
 
+    static BOOL WINAPI GlobalCtrlHandler(DWORD ctrlType) {
+        (void) ctrlType;
+        return TRUE; // Ignoriere alle Events (C, Break, Close, etc.) im Vater
+    }
+
     int executeChild(const fs::path& target, int, NativeChar**, const EnvMap* newEnv) override {
         std::vector<NativeChar> winEnvBlock;
         if (newEnv) {
@@ -450,7 +467,12 @@ public:
         SafeHandle hProc(pi.hProcess), hThread(pi.hThread);
         AssignProcessToJobObject(job, hProc);
         ResumeThread(hThread);
+
+        // Vater auf "Durchzug" stellen: Alle Signale ignorieren, damit das Kind sie verarbeiten kann
+        (void)SetConsoleCtrlHandler(GlobalCtrlHandler, TRUE);
+        
         WaitForSingleObject(hProc, INFINITE);
+
         DWORD code; GetExitCodeProcess(hProc, &code);
         return (int)code;
     }
@@ -507,18 +529,55 @@ public:
             linuxEnvPointers.push_back(nullptr);
         }
 
+        // --- SIGNAL HANDLING SETUP ---
+        sigset_t oldset, fullset;
+        sigfillset(&fullset);
+        // Blockiere alle Signale vor dem Fork, um Race-Conditions zu vermeiden
+        sigprocmask(SIG_BLOCK, &fullset, &oldset);
+
         NativeCout.flush(); NativeCerr.flush();
         pid_t pid = fork();
         if (pid == 0) {
-            prctl(PR_SET_PDEATHSIG, SIGTERM);
+            // IM KIND:
+            // 1. Signale deblockieren (erben den Block-Status)
+            sigprocmask(SIG_SETMASK, &oldset, NULL);
+            // 2. Wichtige Signale auf Default zurücksetzen (falls Vater sie ignorierte)
+            int signalsToReset[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2, SIGWINCH, SIGPWR, SIGALRM };
+            for (int s : signalsToReset) signal(s, SIG_DFL);
+            
+            prctl(PR_SET_PDEATHSIG, SIGTERM); // benign race, in my opion
             execve(target.c_str(), argv, newEnv ? linuxEnvPointers.data() : environ);
             Logger::error("execve fehlgeschlagen: ", target, " (errno: ", errno, ")");
             _exit(Constants::ERR_TARGET);
         } else if (pid > 0) {
+            // IM VATER:
+            g_child_pid = pid;
+            
+            // Relay Handler für relevante Signale registrieren
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = signalRelayHandler;
+            int signalsToRelay[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2, SIGWINCH, SIGPWR, SIGALRM };
+            for (int s : signalsToRelay) sigaction(s, &sa, NULL);
+            
+            // Signale deblockieren, damit Handler/Wait arbeiten können
+            sigprocmask(SIG_SETMASK, &oldset, NULL);
+
             int status;
-            waitpid(pid, &status, 0);
+            // Warte auf das Kind; fange EINTR (durch Signale unterbrochen) ab
+            while (waitpid(pid, &status, 0) == -1) {
+                if (errno != EINTR) {
+                    Logger::error("waitpid fehlgeschlagen (errno: ", errno, ")");
+                    break;
+                }
+            }
+            g_child_pid = 0; // Kind ist weg
             return WIFEXITED(status) ? WEXITSTATUS(status) : Constants::ERR_INTERNAL;
         }
+        
+        // Fork fehlgeschlagen
+        sigprocmask(SIG_SETMASK, &oldset, NULL);
+        Logger::error("fork() fehlgeschlagen (errno: ", errno, ")");
         return Constants::ERR_INTERNAL;
     }
 };

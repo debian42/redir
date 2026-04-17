@@ -128,6 +128,19 @@ function Run-Validation-Pass() {
     ./tester --quiet | grep -q "Ö_VAR=Ä_VAL" && success="true" || success="false"
     report+=("$(finalize_test 14 "Umlaut-Support" "$success" "N/A")")
 
+    # --- TEST 15: SIGNAL FORWARDING (Linux only) ---
+    echo "+ SIGNAL_TEST=1" > tester_conf.env
+    ./tester --wait > test_sig_out.txt 2>&1 &
+    test_pid=$!
+    sleep 0.5
+    kill -SIGUSR1 $test_pid
+    sleep 0.2
+    kill -SIGINT $test_pid
+    wait $test_pid 2>/dev/null
+    grep -q "Linux Signal empfangen: 10 (SIGUSR1 - Custom Logic!)" test_sig_out.txt && success="true" || success="false"
+    rm -f test_sig_out.txt
+    report+=("$(finalize_test 15 "Signal-Forwarding (SIGUSR1)" "$success" "N/A")")
+
     echo -e "\n  Zusammenfassung für $mode_name:"
     for line in "${report[@]}"; do echo -e "  $line"; done
     [[ "${report[*]}" == *"[FAIL]"* ]] && return 1 || return 0

@@ -1,6 +1,8 @@
-# Redir: Cross-Platform Environment Filter Wrapper
-- Text written by Slop-Machine
-  
+# Redir: Cross-Platform Environment Filter Wrapper (Console)
+- The text were written by a Slop-Machine
+
+[Reason](https://www.codecoverage.de/posts/cpp/redir_proxy/)
+
 **Redir** is a high-performance, cross-platform (Windows/Linux) environment variable filter and wrapper written in C++20. It allows you to transparently wrap any executable and modify its environment variables (add, update, or remove) before execution, without modifying the original binary.
 
 ## How It Works
@@ -87,6 +89,18 @@ The project includes an exhaustive "Dual-Mode Validation" suite that tests edge 
 ```bash
 ./run_test.sh
 ```
+
+## Platform Specifics
+
+### Windows
+- **Console Applications only:** The signal handling (Ctrl+C/Break/Close) relies on the Windows Console Subsystem. This wrapper is designed for and should be compiled as a Console Application (`/subsystem:console`).
+- **GUI Apps:** While environment redirection works for GUI apps, signal forwarding via the console handler will not reach them if they don't attach to a console.
+- **Job Objects:** Uses Windows Job Objects to ensure the child process is terminated when the parent is closed.
+
+### Linux
+- **Universal Forwarding:** Signal relaying works for both terminal-based tools and GUI applications (X11/Wayland), as signals are handled at the kernel/PID level.
+- **Race-Condition Protected:** Uses `sigprocmask` and `fork` to ensure no signals are lost during the critical startup phase.
+- **PID Death Signal:** Uses `prctl(PR_SET_PDEATHSIG)` for robust child lifecycle management.
 
 ## Exit Codes
 

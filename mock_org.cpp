@@ -2,18 +2,24 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <unistd.h>
 #include <poll.h>
+#include <signal.h>
 extern char **environ;
 #endif
 
 /**
- * @brief Test-Programm
+ * @brief Test-Programm für Redir Signal Forwarding & Basis-Validierung
  */
+
+std::atomic<bool> keepRunning{true};
 
 #ifdef _WIN32
 std::string to_ansi(const wchar_t* wstr) {
@@ -26,27 +32,57 @@ std::string to_ansi(const wchar_t* wstr) {
     else s.clear();
     return s;
 }
+
+BOOL WINAPI ConsoleHandler(DWORD ctrlType) {
+    std::cout << "[MOCK_ORG] Console Event empfangen: " << ctrlType << std::endl;
+    if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT) {
+        std::cout << "[MOCK_ORG] Beende Test-Loop..." << std::endl;
+        keepRunning = false;
+        return TRUE; 
+    }
+    return FALSE;
+}
+#else
+void signalHandler(int signo) {
+    std::cout << "[MOCK_ORG] Linux Signal empfangen: " << signo;
+    switch(signo) {
+        case SIGUSR1: std::cout << " (SIGUSR1 - Custom Logic!)"; break;
+        case SIGINT:  std::cout << " (SIGINT - Beende...)"; keepRunning = false; break;
+        case SIGTERM: std::cout << " (SIGTERM - Beende...)"; keepRunning = false; break;
+        default: std::cout << " (Anderes Signal)"; break;
+    }
+    std::cout << std::endl;
+}
 #endif
 
 int main(int argc, char* argv[]) {
-    std::cout << "[MOCK_ORG] Startet, Herr Mueller..." << std::endl;
+    bool waitMode = false;
+    for (int i = 0; i < argc; ++i) {
+        if (std::string(argv[i]) == "--wait") waitMode = true;
+    }
 
+    std::cout << "[MOCK_ORG] Startet, Herr Mueller..." << std::endl;
+    std::cout << "[MOCK_ORG] PID: " << 
+#ifdef _WIN32
+        GetCurrentProcessId()
+#else
+        getpid()
+#endif
+        << std::endl;
+
+    // --- WICHTIG FÜR TEST 1: Argumente ausgeben ---
     std::cout << "[MOCK_ORG] Argumente: ";
     for (int i = 0; i < argc; ++i) {
         std::cout << argv[i] << " ";
     }
     std::cout << std::endl;
 
+    // --- WICHTIG FÜR TEST 1: Pipe-Input prüfen ---
     bool hasData = false;
 #ifdef _WIN32
-    if (GetFileType(GetStdHandle(STD_INPUT_HANDLE)) != FILE_TYPE_CHAR) {
-        // Auf Windows blockiert getline meist nicht, wenn die Pipe leer ist, 
-        // aber wir bleiben konsistent.
-        hasData = true; 
-    }
+    if (GetFileType(GetStdHandle(STD_INPUT_HANDLE)) != FILE_TYPE_CHAR) hasData = true;
 #else
     struct pollfd pfd = { STDIN_FILENO, POLLIN, 0 };
-    // poll mit 0ms timeout: Pruefe ob Daten SOFORT lesbar sind
     if (poll(&pfd, 1, 0) > 0) hasData = true;
 #endif
 
@@ -57,6 +93,26 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (waitMode) {
+        std::cout << "[MOCK_ORG] Warte-Modus aktiv. Installiere Handler..." << std::endl;
+#ifdef _WIN32
+        SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+#else
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = signalHandler;
+        sigaction(SIGUSR1, &sa, NULL);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+#endif
+        while (keepRunning) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        std::cout << "[MOCK_ORG] Loop beendet." << std::endl;
+        return 0;
+    }
+
+    // Normaler Environment-Dump Modus
     std::cout << "\n[MOCK_ORG] Rohes Environment (nach ANSI konvertiert):" << std::endl;
 #ifdef _WIN32
     LPWCH es = GetEnvironmentStringsW();
