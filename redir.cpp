@@ -60,6 +60,9 @@
 #include <chrono>
 #include <iomanip>
 #include <ctime>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -74,6 +77,8 @@
 #include <cstring>
 #include <ctype.h>
 #include <cerrno>
+#include <sys/stat.h>
+#include <fcntl.h>
 extern char **environ;
 #endif
 
@@ -86,6 +91,9 @@ using NativeStringView = std::wstring_view;
 #define NATIVE_TEXT(s) L##s
 #define NativeCout std::wcout
 #define NativeCerr std::wcerr
+#define NativeSnprintf swprintf
+
+static HANDLE g_sig_log_handle = INVALID_HANDLE_VALUE;
 #else
 using NativeChar = char;
 using NativeString = std::string;
@@ -93,16 +101,26 @@ using NativeStringView = std::string_view;
 #define NATIVE_TEXT(s) s
 #define NativeCout std::cout
 #define NativeCerr std::cerr
+#define NativeSnprintf snprintf
 
 static volatile sig_atomic_t g_child_pid = 0;
+static int g_sig_log_fd = -1;
+
 static void signalRelayHandler(int signo) {
+    if (g_sig_log_fd != -1) {
+        char msg[64];
+        int n = snprintf(msg, sizeof(msg), "[SIGNAL] Received: %d\n", signo);
+        if (n > 0) {
+            ssize_t written = write(g_sig_log_fd, msg, (size_t)n);
+            (void)written; // Satisfy warn_unused_result
+        }
+    }
     if (g_child_pid > 0) (void) kill(g_child_pid, signo);
 }
 #endif
 
 namespace Constants {
     constexpr NativeStringView CONF_SUFFIX = NATIVE_TEXT("_conf.env");
-    constexpr NativeStringView DUMP_SUFFIX = NATIVE_TEXT("_env.txt");
 #ifdef _WIN32
     constexpr NativeStringView ORG_SUFFIX  = NATIVE_TEXT("_org.exe");
 #else
@@ -110,10 +128,91 @@ namespace Constants {
 #endif
     enum ExitCode { SUCCESS = 0, ERR_INTERNAL = 100, ERR_CONFIG = 101, ERR_TARGET = 102 };
 
+    constexpr NativeStringView DEBUG_VAR = NATIVE_TEXT("REDIR_DEBUG");
+
     // --- SECURITY POLICY ---
     constexpr size_t MAX_CONFIG_SIZE = 1024 * 1024; // 1 MB
     constexpr size_t MAX_LINE_SIZE   = 32 * 1024;   // 32 KB
 }
+
+struct DebugFlags {
+    bool preEnv = false;
+    bool postEnv = false;
+    bool dumpArgs = false;
+    bool dumpPipes = false;
+    bool dumpSignals = false;
+    bool dumpIO = false;
+
+    static DebugFlags parse(NativeStringView val) {
+        DebugFlags flags;
+        // Senior-Expert Trick: Alle Leerzeichen entfernen
+        NativeString clean;
+        clean.reserve(val.size());
+        for (auto c : val) if (c != NATIVE_TEXT(' ')) clean.push_back(c);
+
+        size_t start = 0;
+        while (start < clean.size()) {
+            size_t end = clean.find(NATIVE_TEXT(','), start);
+            size_t len = (end == NativeString::npos) ? (clean.size() - start) : (end - start);
+            
+            if (len > 0) {
+                NativeStringView part(clean.data() + start, len);
+                if (part == NATIVE_TEXT("PRE_ENV")) flags.preEnv = true;
+                else if (part == NATIVE_TEXT("POST_ENV")) flags.postEnv = true;
+                else if (part == NATIVE_TEXT("DUMP_ARGS")) flags.dumpArgs = true;
+                else if (part == NATIVE_TEXT("DUMP_PIPES")) flags.dumpPipes = true;
+                else if (part == NATIVE_TEXT("DUMP_SIGNALS")) flags.dumpSignals = true;
+                else if (part == NATIVE_TEXT("DUMP_IO")) flags.dumpIO = true;
+            }
+            
+            if (end == NativeString::npos) break;
+            start = end + 1;
+        }
+        return flags;
+    }
+};
+
+#ifdef _WIN32
+static BOOL WINAPI GlobalCtrlHandler(DWORD ctrlType) {
+    if (g_sig_log_handle != INVALID_HANDLE_VALUE) {
+        char msg[64];
+        int n = snprintf(msg, sizeof(msg), "[SIGNAL] Windows Event: %lu\n", ctrlType);
+        if (n > 0) {
+            DWORD written;
+            WriteFile(g_sig_log_handle, msg, (DWORD)n, &written, NULL);
+        }
+    }
+    return TRUE; 
+}
+#endif
+
+struct IORelay {
+    static void relay(std::atomic<bool>& running, 
+#ifdef _WIN32
+                     HANDLE src, HANDLE dst, 
+#else
+                     int src, int dst, 
+#endif
+                     const fs::path& dumpPath) {
+        std::ofstream dump(dumpPath, std::ios::binary);
+        std::vector<char> buffer(64 * 1024);
+        while (running) {
+#ifdef _WIN32
+            DWORD bytesRead = 0;
+            if (!ReadFile(src, buffer.data(), (DWORD)buffer.size(), &bytesRead, NULL) || bytesRead == 0) break;
+            if (dump.is_open()) { dump.write(buffer.data(), bytesRead); dump.flush(); }
+            DWORD bytesWritten = 0;
+            if (!WriteFile(dst, buffer.data(), bytesRead, &bytesWritten, NULL)) break;
+#else
+            ssize_t n = read(src, buffer.data(), buffer.size());
+            if (n < 0) { if (errno == EAGAIN || errno == EINTR) continue; break; }
+            if (n == 0) break;
+            if (dump.is_open()) { dump.write(buffer.data(), n); dump.flush(); }
+            if (write(dst, buffer.data(), (size_t)n) <= 0) break;
+#endif
+        }
+    }
+};
 
 class Logger {
 public:
@@ -127,6 +226,23 @@ public:
     
     template<typename... Args>
     NOINLINE COLD static void error(Args&&... args) { log(Level::Error, std::forward<Args>(args)...); }
+
+    static NativeString getFileTimestamp() {
+        auto now = std::chrono::system_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        auto timer = std::chrono::system_clock::to_time_t(now);
+        std::tm tm_buf;
+#ifdef _WIN32
+        localtime_s(&tm_buf, &timer);
+#else
+        localtime_r(&timer, &tm_buf);
+#endif
+        NativeChar buf[128];
+        NativeSnprintf(buf, 128, NATIVE_TEXT("%04d%02d%02d_%02d%02d%02d_%03d"),
+            tm_buf.tm_year + 1900, tm_buf.tm_mon + 1, tm_buf.tm_mday,
+            tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, (int)ms.count());
+        return NativeString(buf);
+    }
 
 private:
 #ifdef _WIN32
@@ -321,9 +437,13 @@ public:
     virtual void setupConsole() = 0;
     virtual PathResult getExecutablePath() = 0;
     virtual EnvMap getSystemEnvironment() = 0;
-    virtual void dumpEnvironment(const fs::path& basePath) = 0;
+    virtual void dumpEnvironment(const fs::path& basePath, const EnvMap& env, NativeStringView suffix) = 0;
+    virtual void dumpArgs(const fs::path& basePath, int argc, NativeChar** argv) = 0;
+    virtual void dumpPipes(const fs::path& basePath) = 0;
+    virtual void dumpSignals(const fs::path& basePath) = 0;
     virtual bool isRedirEnabled() = 0;
-    virtual int executeChild(const fs::path& target, int argc, NativeChar** argv, const EnvMap* newEnv) = 0;
+    virtual DebugFlags getDebugFlags() = 0;
+    virtual int executeChild(const fs::path& target, int argc, NativeChar** argv, const EnvMap* newEnv, const fs::path& basePath, const DebugFlags& flags) = 0;
 
     EnvResult prepareEnvironment(const fs::path& basePath) {
         if (!isRedirEnabled()) return { nullptr, Constants::SUCCESS };
@@ -382,6 +502,13 @@ public:
         return (GetEnvironmentVariableW(L"REDIR_ENABLE_REDIR", redirFlag, 4) > 0 && redirFlag[0] == L'1');
     }
 
+    DebugFlags getDebugFlags() override {
+        wchar_t flag[256];
+        DWORD res = GetEnvironmentVariableW(Constants::DEBUG_VAR.data(), flag, 256);
+        if (res > 0 && res < 256) return DebugFlags::parse(flag);
+        return {};
+    }
+
     PathResult getExecutablePath() override {
         NativeString rawPath;
         DWORD bufferSize = MAX_PATH;
@@ -408,33 +535,99 @@ public:
         return env;
     }
 
-    void dumpEnvironment(const fs::path& basePath) override {
-        wchar_t flag[4];
-        if (GetEnvironmentVariableW(L"REDIR_DUMP_ENV", flag, 4) > 0 && flag[0] == L'1') {
-            NativeString fileName = basePath.stem().native() + NativeString(NATIVE_TEXT("_")) + std::to_wstring(GetCurrentProcessId()) + NativeString(Constants::DUMP_SUFFIX);
-            std::ofstream file(basePath.parent_path() / fileName, std::ios::binary);
-            if (!file) return;
-            if (LPWCH sysEnv = GetEnvironmentStringsW()) {
-                for (LPWCH entry = sysEnv; *entry; entry += wcslen(entry) + 1) {
-                    int sz = WideCharToMultiByte(CP_UTF8, 0, entry, -1, NULL, 0, NULL, NULL);
-                    if (sz > 1) {
-                        std::string u8(sz, 0);
-                        WideCharToMultiByte(CP_UTF8, 0, entry, -1, u8.data(), sz, NULL, NULL);
-                        file.write(u8.data(), sz - 1); 
-                    }
-                    file.write("\r\n", 2);
-                }
-                FreeEnvironmentStringsW(sysEnv);
+    void dumpEnvironment(const fs::path& basePath, const EnvMap& env, NativeStringView suffix) override {
+        NativeString fileName = basePath.stem().native() + NATIVE_TEXT("_") + std::to_wstring(GetCurrentProcessId()) + 
+                              NATIVE_TEXT("_") + Logger::getFileTimestamp() + NativeString(suffix) + NATIVE_TEXT(".txt");
+        std::ofstream file(basePath.parent_path() / fileName, std::ios::binary);
+        if (!file) return;
+        for (auto const& [k, v] : env) {
+            std::wstring entry = k + L"=" + v + L"\r\n";
+            int sz = WideCharToMultiByte(CP_UTF8, 0, entry.c_str(), -1, NULL, 0, NULL, NULL);
+            if (sz > 1) {
+                std::string u8(sz, 0);
+                WideCharToMultiByte(CP_UTF8, 0, entry.c_str(), -1, u8.data(), sz, NULL, NULL);
+                file.write(u8.data(), sz - 1); 
             }
         }
     }
 
-    static BOOL WINAPI GlobalCtrlHandler(DWORD ctrlType) {
-        (void) ctrlType;
-        return TRUE; // Ignoriere alle Events (C, Break, Close, etc.) im Vater
+    void dumpArgs(const fs::path& basePath, int, NativeChar**) override {
+        NativeString fileName = basePath.stem().native() + NATIVE_TEXT("_") + std::to_wstring(GetCurrentProcessId()) + 
+                              NATIVE_TEXT("_") + Logger::getFileTimestamp() + NATIVE_TEXT("_args.txt");
+        std::ofstream file(basePath.parent_path() / fileName, std::ios::binary);
+        if (!file) return;
+        std::wstring cmdLine = GetCommandLineW();
+        int sz = WideCharToMultiByte(CP_UTF8, 0, cmdLine.c_str(), -1, NULL, 0, NULL, NULL);
+        if (sz > 1) {
+            std::string u8(sz, 0);
+            WideCharToMultiByte(CP_UTF8, 0, cmdLine.c_str(), -1, u8.data(), sz, NULL, NULL);
+            file.write(u8.data(), sz - 1); 
+        }
     }
 
-    int executeChild(const fs::path& target, int, NativeChar**, const EnvMap* newEnv) override {
+    void dumpPipes(const fs::path& basePath) override {
+        NativeString fileName = basePath.stem().native() + NATIVE_TEXT("_") + std::to_wstring(GetCurrentProcessId()) + 
+                              NATIVE_TEXT("_") + Logger::getFileTimestamp() + NATIVE_TEXT("_pipes.txt");
+        std::ofstream file(basePath.parent_path() / fileName);
+        if (!file) return;
+        auto checkPipe = [&](DWORD stdHandle, const char* name) {
+            HANDLE h = GetStdHandle(stdHandle);
+            file << name << ": ";
+            if (h == INVALID_HANDLE_VALUE) file << "INVALID";
+            else if (h == NULL) file << "NULL";
+            else {
+                DWORD mode;
+                if (GetConsoleMode(h, &mode)) file << "CONSOLE";
+                else {
+                    DWORD type = GetFileType(h);
+                    if (type == FILE_TYPE_CHAR) file << "CHAR";
+                    else if (type == FILE_TYPE_DISK) file << "DISK";
+                    else if (type == FILE_TYPE_PIPE) file << "PIPE";
+                    else file << "UNKNOWN(" << type << ")";
+                }
+            }
+            file << "\n";
+        };
+        checkPipe(STD_INPUT_HANDLE, "stdin");
+        checkPipe(STD_OUTPUT_HANDLE, "stdout");
+        checkPipe(STD_ERROR_HANDLE, "stderr");
+    }
+
+    void dumpSignals(const fs::path& basePath) override {
+        NativeString fileName = basePath.stem().native() + NATIVE_TEXT("_") + std::to_wstring(GetCurrentProcessId()) + 
+                              NATIVE_TEXT("_") + Logger::getFileTimestamp() + NATIVE_TEXT("_signals.txt");
+        g_sig_log_handle = CreateFileW((basePath.parent_path() / fileName).c_str(), GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (g_sig_log_handle != INVALID_HANDLE_VALUE) {
+            const char* msg = "Windows Signal Handling: Persistent log active.\n";
+            DWORD written;
+            WriteFile(g_sig_log_handle, msg, (DWORD)strlen(msg), &written, NULL);
+        }
+    }
+
+    int executeChild(const fs::path& target, int argc, NativeChar** argv, const EnvMap* newEnv, const fs::path& basePath, const DebugFlags& flags) override {
+        if (flags.dumpArgs) dumpArgs(basePath, argc, argv);
+        if (flags.dumpPipes) dumpPipes(basePath);
+        if (flags.dumpSignals) dumpSignals(basePath);
+
+        std::atomic<bool> ioRunning{true};
+        std::thread tIn, tOut, tErr;
+        HANDLE hChildInR = NULL, hChildInW = NULL;
+        HANDLE hChildOutR = NULL, hChildOutW = NULL;
+        HANDLE hChildErrR = NULL, hChildErrW = NULL;
+
+        if (flags.dumpIO) {
+            SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+            if (!CreatePipe(&hChildInR, &hChildInW, &sa, 0) ||
+                !CreatePipe(&hChildOutR, &hChildOutW, &sa, 0) ||
+                !CreatePipe(&hChildErrR, &hChildErrW, &sa, 0)) {
+                Logger::error("Konnte Pipes fuer DUMP_IO nicht erstellen.");
+                return Constants::ERR_INTERNAL;
+            }
+            SetHandleInformation(hChildInW, HANDLE_FLAG_INHERIT, 0);
+            SetHandleInformation(hChildOutR, HANDLE_FLAG_INHERIT, 0);
+            SetHandleInformation(hChildErrR, HANDLE_FLAG_INHERIT, 0);
+        }
+
         std::vector<NativeChar> winEnvBlock;
         if (newEnv) {
             size_t total = 1;
@@ -456,22 +649,60 @@ public:
 
         STARTUPINFOW si = { sizeof(si) };
         si.dwFlags |= STARTF_USESTDHANDLES;
-        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE); si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        if (flags.dumpIO) {
+            si.hStdInput = hChildInR; si.hStdOutput = hChildOutW; si.hStdError = hChildErrW;
+        } else {
+            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE); si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        }
         PROCESS_INFORMATION pi = { 0 };
 
         NativeCout.flush(); NativeCerr.flush();
         if (!CreateProcessW(target.c_str(), GetCommandLineW(), 0, 0, 1, CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED, newEnv ? winEnvBlock.data() : nullptr, 0, &si, &pi)) {
             Logger::error("Start fehlgeschlagen: ", target, " (Code: ", GetLastError(), ")");
+            if (flags.dumpIO) { CloseHandle(hChildInR); CloseHandle(hChildInW); CloseHandle(hChildOutR); CloseHandle(hChildOutW); CloseHandle(hChildErrR); CloseHandle(hChildErrW); }
             return Constants::ERR_TARGET;
         }
         SafeHandle hProc(pi.hProcess), hThread(pi.hThread);
         AssignProcessToJobObject(job, hProc);
         ResumeThread(hThread);
 
+        if (flags.dumpIO) {
+            CloseHandle(hChildInR); CloseHandle(hChildOutW); CloseHandle(hChildErrW);
+            NativeString ts = Logger::getFileTimestamp();
+            NativeString pfx = basePath.stem().native() + NATIVE_TEXT("_") + std::to_wstring(GetCurrentProcessId()) + NATIVE_TEXT("_") + ts;
+            
+            // tIn Relay: Liest von Parent-Stdin, schreibt in hChildInW
+            tIn = std::thread([&ioRunning, hChildInW, basePath, pfx]() {
+                IORelay::relay(std::ref(ioRunning), GetStdHandle(STD_INPUT_HANDLE), hChildInW, basePath.parent_path() / (pfx + NATIVE_TEXT("_stdin.bin")));
+                // WICHTIG: hChildInW SOFORT schließen, damit das Kind EOF sieht
+                CloseHandle(hChildInW);
+            });
+
+            tOut = std::thread(IORelay::relay, std::ref(ioRunning), hChildOutR, GetStdHandle(STD_OUTPUT_HANDLE), basePath.parent_path() / (pfx + NATIVE_TEXT("_stdout.bin")));
+            tErr = std::thread(IORelay::relay, std::ref(ioRunning), hChildErrR, GetStdHandle(STD_ERROR_HANDLE), basePath.parent_path() / (pfx + NATIVE_TEXT("_stderr.bin")));
+        }
+
         // Vater auf "Durchzug" stellen: Alle Signale ignorieren, damit das Kind sie verarbeiten kann
         (void)SetConsoleCtrlHandler(GlobalCtrlHandler, TRUE);
         
         WaitForSingleObject(hProc, INFINITE);
+
+        ioRunning = false;
+        
+        if (flags.dumpIO) {
+            // Unblock tIn if it's waiting for console input
+            CancelSynchronousIo(tIn.native_handle());
+            
+            // hChildInW wird bereits im Lambda von tIn geschlossen.
+            if (hChildOutR) CloseHandle(hChildOutR);
+            if (hChildErrR) CloseHandle(hChildErrR);
+
+            if (tIn.joinable()) tIn.join();
+            if (tOut.joinable()) tOut.join();
+            if (tErr.joinable()) tErr.join();
+        }
+
+        if (g_sig_log_handle != INVALID_HANDLE_VALUE) { CloseHandle(g_sig_log_handle); g_sig_log_handle = INVALID_HANDLE_VALUE; }
 
         DWORD code; GetExitCodeProcess(hProc, &code);
         return (int)code;
@@ -485,6 +716,11 @@ public:
     bool isRedirEnabled() override {
         const char* p = std::getenv("REDIR_ENABLE_REDIR");
         return (p && p[0] == '1');
+    }
+
+    DebugFlags getDebugFlags() override {
+        const char* p = std::getenv(std::string(Constants::DEBUG_VAR.begin(), Constants::DEBUG_VAR.end()).c_str());
+        return p ? DebugFlags::parse(p) : DebugFlags{};
     }
 
     PathResult getExecutablePath() override {
@@ -505,20 +741,72 @@ public:
         return env;
     }
 
-    void dumpEnvironment(const fs::path& basePath) override {
-        const char* p = std::getenv("REDIR_DUMP_ENV");
-        if (p && p[0] == '1') {
-            NativeString fileName = basePath.stem().native() + NativeString(NATIVE_TEXT("_")) + std::to_string(getpid()) + NativeString(Constants::DUMP_SUFFIX);
-            std::ofstream file(basePath.parent_path() / fileName, std::ios::binary);
-            if (!file) return;
-            for (char **e = environ; *e; ++e) {
-                file.write(*e, strlen(*e));
-                file.write("\n", 1);
-            }
+    void dumpEnvironment(const fs::path& basePath, const EnvMap& env, NativeStringView suffix) override {
+        NativeString fileName = basePath.stem().native() + "_" + std::to_string(getpid()) + "_" + Logger::getFileTimestamp() + std::string(suffix) + ".txt";
+        std::ofstream file(basePath.parent_path() / fileName, std::ios::binary);
+        if (!file) return;
+        for (auto const& [k, v] : env) {
+            file << k << "=" << v << "\n";
         }
     }
 
-    int executeChild(const fs::path& target, int, char** argv, const EnvMap* newEnv) override {
+    void dumpArgs(const fs::path& basePath, int argc, char** argv) override {
+        NativeString fileName = basePath.stem().native() + "_" + std::to_string(getpid()) + "_" + Logger::getFileTimestamp() + "_args.txt";
+        std::ofstream file(basePath.parent_path() / fileName);
+        if (!file) return;
+        for (int i = 0; i < argc; ++i) {
+            file << "argv[" << i << "]: " << argv[i] << "\n";
+        }
+    }
+
+    void dumpPipes(const fs::path& basePath) override {
+        NativeString fileName = basePath.stem().native() + "_" + std::to_string(getpid()) + "_" + Logger::getFileTimestamp() + "_pipes.txt";
+        std::ofstream file(basePath.parent_path() / fileName);
+        if (!file) return;
+        auto checkPipe = [&](int fd, const char* name) {
+            file << name << ": ";
+            if (isatty(fd)) file << "TTY";
+            else {
+                struct stat st;
+                if (fstat(fd, &st) == -1) file << "INVALID";
+                else if (S_ISFIFO(st.st_mode)) file << "FIFO";
+                else if (S_ISCHR(st.st_mode)) file << "CHAR";
+                else if (S_ISREG(st.st_mode)) file << "REGULAR";
+                else file << "UNKNOWN";
+            }
+            file << "\n";
+        };
+        checkPipe(STDIN_FILENO, "stdin");
+        checkPipe(STDOUT_FILENO, "stdout");
+        checkPipe(STDERR_FILENO, "stderr");
+    }
+
+    void dumpSignals(const fs::path& basePath) override {
+        NativeString fileName = basePath.stem().native() + "_" + std::to_string(getpid()) + "_" + Logger::getFileTimestamp() + "_signals.txt";
+        g_sig_log_fd = open((basePath.parent_path() / fileName).c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (g_sig_log_fd != -1) {
+            const char* msg = "Linux Signal Handling: Persistent log active.\n";
+            ssize_t written = write(g_sig_log_fd, msg, strlen(msg));
+            (void)written; // Satisfy warn_unused_result
+        }
+    }
+
+    int executeChild(const fs::path& target, int argc, char** argv, const EnvMap* newEnv, const fs::path& basePath, const DebugFlags& flags) override {
+        if (flags.dumpArgs) dumpArgs(basePath, argc, argv);
+        if (flags.dumpPipes) dumpPipes(basePath);
+        if (flags.dumpSignals) dumpSignals(basePath);
+
+        std::atomic<bool> ioRunning{true};
+        std::thread tIn, tOut, tErr;
+        int pIn[2], pOut[2], pErr[2];
+
+        if (flags.dumpIO) {
+            if (pipe(pIn) == -1 || pipe(pOut) == -1 || pipe(pErr) == -1) {
+                Logger::error("Konnte Pipes fuer DUMP_IO nicht erstellen (errno: ", errno, ")");
+                return Constants::ERR_INTERNAL;
+            }
+        }
+
         std::deque<std::string> linuxEnvStorage;
         std::vector<char*> linuxEnvPointers;
         if (newEnv) {
@@ -539,6 +827,11 @@ public:
         pid_t pid = fork();
         if (pid == 0) {
             // IM KIND:
+            if (flags.dumpIO) {
+                dup2(pIn[0], STDIN_FILENO); close(pIn[0]); close(pIn[1]);
+                dup2(pOut[1], STDOUT_FILENO); close(pOut[0]); close(pOut[1]);
+                dup2(pErr[1], STDERR_FILENO); close(pErr[0]); close(pErr[1]);
+            }
             // 1. Signale deblockieren (erben den Block-Status)
             sigprocmask(SIG_SETMASK, &oldset, NULL);
             // 2. Wichtige Signale auf Default zurücksetzen (falls Vater sie ignorierte)
@@ -552,6 +845,16 @@ public:
         } else if (pid > 0) {
             // IM VATER:
             g_child_pid = pid;
+            if (flags.dumpIO) {
+                // WICHTIG: Pipe-Enden, die das Kind nutzt, im Vater SOFORT schließen
+                close(pIn[0]); close(pOut[1]); close(pErr[1]);
+                
+                std::string ts = Logger::getFileTimestamp();
+                std::string pfx = basePath.stem().native() + "_" + std::to_string(getpid()) + "_" + ts;
+                tIn = std::thread(IORelay::relay, std::ref(ioRunning), STDIN_FILENO, pIn[1], basePath.parent_path() / (pfx + "_stdin.bin"));
+                tOut = std::thread(IORelay::relay, std::ref(ioRunning), pOut[0], STDOUT_FILENO, basePath.parent_path() / (pfx + "_stdout.bin"));
+                tErr = std::thread(IORelay::relay, std::ref(ioRunning), pErr[0], STDERR_FILENO, basePath.parent_path() / (pfx + "_stderr.bin"));
+            }
             
             // Relay Handler für relevante Signale registrieren
             struct sigaction sa;
@@ -564,19 +867,31 @@ public:
             sigprocmask(SIG_SETMASK, &oldset, NULL);
 
             int status;
-            // Warte auf das Kind; fange EINTR (durch Signale unterbrochen) ab
             while (waitpid(pid, &status, 0) == -1) {
-                if (errno != EINTR) {
-                    Logger::error("waitpid fehlgeschlagen (errno: ", errno, ")");
-                    break;
-                }
+                if (errno != EINTR) break;
             }
-            g_child_pid = 0; // Kind ist weg
+            g_child_pid = 0; 
+
+            ioRunning = false;
+            if (flags.dumpIO) {
+                // Schließe die Vater-Enden der Pipes, um blockierende Reads in tOut/tErr zu lösen
+                close(pIn[1]); close(pOut[0]); close(pErr[0]);
+                
+                // Für tIn (blockiert auf STDIN_FILENO) nutzen wir pthread_cancel
+#ifndef _WIN32
+                pthread_cancel(tIn.native_handle());
+#endif
+                if (tIn.joinable()) tIn.join();
+                if (tOut.joinable()) tOut.join();
+                if (tErr.joinable()) tErr.join();
+            }
+            if (g_sig_log_fd != -1) { close(g_sig_log_fd); g_sig_log_fd = -1; }
             return WIFEXITED(status) ? WEXITSTATUS(status) : Constants::ERR_INTERNAL;
         }
         
         // Fork fehlgeschlagen
         sigprocmask(SIG_SETMASK, &oldset, NULL);
+        if (flags.dumpIO) { close(pIn[0]); close(pIn[1]); close(pOut[0]); close(pOut[1]); close(pErr[0]); close(pErr[1]); }
         Logger::error("fork() fehlgeschlagen (errno: ", errno, ")");
         return Constants::ERR_INTERNAL;
     }
@@ -607,7 +922,9 @@ int main(int argc, NativeChar** argv) {
     
     fs::path exePath = pathRes.path;
     fs::path basePath = exePath; basePath.replace_extension();
-    bridge->dumpEnvironment(basePath);
+    
+    DebugFlags flags = bridge->getDebugFlags();
+    if (flags.preEnv) bridge->dumpEnvironment(basePath, bridge->getSystemEnvironment(), NATIVE_TEXT("_pre_env"));
 
     EnvResult envRes = bridge->prepareEnvironment(basePath);
     if (envRes.status != Constants::SUCCESS) {
@@ -615,6 +932,8 @@ int main(int argc, NativeChar** argv) {
         return envRes.status;
     }
     
+    if (flags.postEnv && envRes.env) bridge->dumpEnvironment(basePath, *envRes.env, NATIVE_TEXT("_post_env"));
+
     fs::path target = basePath.native() + NativeString(Constants::ORG_SUFFIX);
-    return bridge->executeChild(target, argc, argv, envRes.env.get());
+    return bridge->executeChild(target, argc, argv, envRes.env.get(), basePath, flags);
 }

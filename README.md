@@ -1,126 +1,76 @@
-# Redir: Cross-Platform Environment Filter Wrapper (Console)
+# Redir: Cross-Platform Environment Filter Wrapper & Debug Proxy (Console)
 - The text were written by a Slop-Machine
 
 [Reason](https://www.codecoverage.de/posts/cpp/redir_proxy/)
 
-**Redir** is a high-performance, cross-platform (Windows/Linux) environment variable filter and wrapper written in C++20. It allows you to transparently wrap any executable and modify its environment variables (add, update, or remove) before execution, without modifying the original binary.
+**Redir** ist ein hochperformanter, plattformübergreifender (Windows/Linux) Wrapper für Konsolenanwendungen, geschrieben in C++20. Er ermöglicht das gezielte Filtern von Umgebungsvariablen und bietet ein mächtiges Diagnose-Toolkit zur tiefgehenden Prozessanalyse.
 
-## How It Works
+## Kernfunktionen
 
-The wrapper operates by acting as a proxy for a target executable:
-1. **Naming Convention**: If your original application is `myapp.exe`, you rename it to `myapp_org.exe` and name the Redir binary `myapp.exe`.
-2. **Configuration**: Redir looks for a configuration file named `myapp_conf.env` in the same directory.
-3. **Redirection**: When `myapp.exe` (the wrapper) is launched, it reads the config, modifies the environment, and executes `myapp_org.exe` (the target), passing through all command-line arguments and standard I/O streams.
+- **Umgebungs-Filterung**: Präzises Hinzufügen (`+`) oder Entfernen (`-`) von Variablen über eine Konfigurationsdatei.
+- **Transparente Weiterleitung**: Signale (Ctrl+C, SIGUSR1/2, etc.) und Exit-Codes werden ohne Verzug an den Child-Prozess durchgereicht.
+- **I/O Proxy Mode**: Echtzeit-Monitoring von stdin, stdout und stderr über binäre Dumps mittels dedizierter Relay-Threads.
+- **Persistent Signal Logging**: Protokollierung aller eintreffenden Signale während der gesamten Laufzeit.
+- **Statische Binaries**: Komplett unabhängig von externen Laufzeitbibliotheken.
 
-## Features
+## Diagnose & Debugging (`REDIR_DEBUG`)
 
-- **Surgical Environment Control**: Add (`+`) or remove (`-`) variables with precision.
-- **Cross-Platform**: Native implementations for Windows (Win32 API) and Linux (POSIX/fork/exec).
-- **Robust Parser**: Handles UTF-8 (with/without BOM), different line endings (LF/CRLF), and trims whitespace automatically.
-- **Zero Dependencies**: Static builds ensure the wrapper runs on any system without extra DLLs or libraries.
-- **Security Limits**: 1MB config file limit and 32KB per-line limit to prevent abuse.
-- **Diagnostic Mode**: Can dump the resulting environment to a file for troubleshooting.
+Die Steuerung der Diagnose erfolgt über die Umgebungsvariable `REDIR_DEBUG`. Diese erwartet eine Liste von Flags (getrennt durch `,`).
 
-## Building the Project
+### Verfügbare Flags:
 
-### Prerequisites
-- **Windows**: MSVC (Visual Studio) with C++20 support.
-- **Linux**: GCC or Clang with C++20 support.
+| Flag | Beschreibung | Dateisuffix |
+| :--- | :--- | :--- |
+| `PRE_ENV` | Dumpt das Environment exakt so, wie der Wrapper es empfangen hat. | `*_pre_env.txt` |
+| `POST_ENV` | Dumpt das Environment nach Anwendung aller Filter (`_conf.env`). | `*_post_env.txt` |
+| `DUMP_ARGS` | Protokolliert die vollständigen Kommandozeilenargumente. | `*_args.txt` |
+| `DUMP_PIPES` | Analysiert die Stream-Typen (TTY, Pipe, File) vor dem Start. | `*_pipes.txt` |
+| `DUMP_SIGNALS`| Erzeugt ein permanentes Log aller empfangenen Signale/Events. | `*_signals.txt` |
+| `DUMP_IO` | Aktiviert den Mitlese-Proxy für stdin, stdout und stderr. | `*_stdin.bin`, etc. |
 
-### Windows Build
-Run the provided batch script in a Developer Command Prompt:
+**Beispiel für die Aktivierung:**
+```bash
+# Mehrere Diagnosen gleichzeitig unter Linux
+export REDIR_DEBUG="POST_ENV,DUMP_SIGNALS,DUMP_IO"
+./myapp
+```
+
+### Dateinamenschema
+Alle Diagnose-Dateien folgen einem konsistenten Schema für eindeutige Zuordnung:
+`[AppName]_[PID]_[Zeitstempel]_[Kategorie].[Endung]`
+
+- **PID**: Die Prozess-ID des Wrappers.
+- **Zeitstempel**: Hochauflösend im Format `YYYYMMDD_HHMMSS_mmm` (Millisekunden-Präzision).
+
+## Konfiguration (`*_conf.env`)
+
+Die Filter-Logik wird über eine Datei gesteuert, die den Namen der ausführbaren Datei trägt, ergänzt um das Suffix `_conf.env`.
+
+**Syntax:**
+- `#` oder `;` leiten Kommentare ein.
+- `+ KEY = VALUE`: Setzt eine Variable (Whitespaces um das `=` werden automatisch entfernt).
+- `- KEY`: Entfernt die Variable aus der Umgebung des Kindprozesses.
+
+## Sicherheits- & Stabilitätsmerkmale
+
+- **Memory Safety**: Konsequente Nutzung von modernem C++20 (`std::string_view`, `std::unique_ptr`).
+- **Ressourcen-Limits**: Schutz vor DoS durch Begrenzung der Konfigurationsgröße (1MB) und Zeilenlänge (32KB).
+- **Deadlock-Prävention**: Der I/O-Proxy nutzt Hintergrund-Threads mit `CancelSynchronousIo` (Win) / `pthread_cancel` (Linux), um Hänger bei blockierenden Konsolen-Eingaben zu vermeiden.
+- **Async-Signal Safety**: Linux-Signal-Logging nutzt ausschließlich sichere System-Calls (`write`).
+
+## Build-Anweisungen
+
+### Windows (MSVC)
+Nutze die `build.cmd` für einen `/analyze`-geprüften Build.
 ```cmd
 build.cmd
 ```
-This produces `redir.exe` and a `mock_org.exe` (for testing) using static linking (`/MT`).
 
-### Linux Build
-Run the shell script:
+### Linux (GCC/Clang)
+Nutze die `build.sh` für eine komplett statisch gelinkte Binary.
 ```bash
-chmod +x build.sh
 ./build.sh
 ```
-This produces a statically linked and stripped `redir` binary.
-
-## Usage
-
-### 1. Setup
-1. Rename your target application to include the `_org` suffix (e.g., `tool.exe` -> `tool_org.exe`).
-2. Copy the `redir` binary to the original name (`tool.exe`).
-3. Create a configuration file `tool_conf.env`.
-
-### 2. Configuration (`*_conf.env`)
-The configuration file uses a simple prefix-based syntax:
-
-```env
-# Use '+' to add or overwrite a variable (format: + KEY = VALUE)
-+ API_KEY = 12345-ABCDE
-+ APP_DEBUG = true
-
-# Use '-' to remove a variable (format: - KEY)
-- HTTP_PROXY
-- TEMP_SECRET
-
-# Empty values are supported
-+ CLEAR_VAR = 
-
-# Comments start with # or ;
-```
-
-### 3. Execution Flags
-Redir is controlled by specific environment variables:
-
-| Variable | Value | Description |
-| :--- | :--- | :--- |
-| `REDIR_ENABLE_REDIR` | `1` | **Required**. Must be set to `1` to activate filtering. Otherwise, it performs a simple pass-through. |
-| `REDIR_DUMP_ENV` | `1` | Optional. If set, dumps the final environment to `[exe]_pid_env.txt`. |
-| `REDIR_ENABLE_U16TEXT`| `1` | (Windows only). Enables UTF-16 mode for console output. |
-
-## Testing
-
-The project includes an exhaustive "Dual-Mode Validation" suite that tests edge cases like BOM handling, whitespace robustness, and exit code propagation.
-
-### Windows (PowerShell)
-```powershell
-./run_test.ps1
-```
-
-### Linux (Bash)
-```bash
-./run_test.sh
-```
-
-## Platform Specifics
-
-### Windows
-- **Console Applications only:** The signal handling (Ctrl+C/Break/Close) relies on the Windows Console Subsystem. This wrapper is designed for and should be compiled as a Console Application (`/subsystem:console`).
-- **GUI Apps:** While environment redirection works for GUI apps, signal forwarding via the console handler will not reach them if they don't attach to a console.
-- **Job Objects:** Uses Windows Job Objects to ensure the child process is terminated when the parent is closed.
-
-### Linux
-- **Universal Forwarding:** Signal relaying works for both terminal-based tools and GUI applications (X11/Wayland), as signals are handled at the kernel/PID level.
-- **Race-Condition Protected:** Uses `sigprocmask` and `fork` to ensure no signals are lost during the critical startup phase.
-- **PID Death Signal:** Uses `prctl(PR_SET_PDEATHSIG)` for robust child lifecycle management.
-
-## Exit Codes
-
-Redir propagates the exit code of the target application. If an error occurs within the wrapper itself, it returns:
-- `100`: Internal/System Error (e.g., STL Exception).
-- `101`: Configuration Error (e.g., invalid syntax in `.env`).
-- `102`: Target Not Found (e.g., `*_org` file is missing).
 
 ---
-
-## Credits & Evolution
-
-This project is a sophisticated synthesis of **Vibe Coding** and **Augmented Coding**, developed in a collaborative partnership between a Senior Developer and **Gemini 3 Flash (Preview)**.
-
-### The Hybrid Approach
-*   **Vibe Coding (Discovery)**: The initial vision and cross-platform logic were driven by high-level intent and rapid iteration. This phase focused on "the vibe"—getting a functional tool for Windows and Linux into the world at lightning speed.
-*   **Augmented Coding (Refinement)**: The project was then hardened using rigorous software engineering principles. This involved "Senior-level" architectural decisions like the **Bridge Pattern**, strict C++20 compliance, and exhaustive validation.
-
-### An Honest Note on Process
-While AI-assisted coding is fast in the "creative spark" phase, reaching production-ready quality (handling UTF-8 BOMs, cross-platform handle management, etc.) was a long and arduous journey. In fact, it's fair to say that a Senior Developer might have reached the finish line faster with traditional coding. 
-
-However, the result is a unique "Vibe-Coded" artifact that stands as a testament to human-AI patience and the pursuit of perfection through hundreds of iterations.
 

@@ -38,6 +38,8 @@ BOOL WINAPI ConsoleHandler(DWORD ctrlType) {
     if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT) {
         std::cout << "[MOCK_ORG] Beende Test-Loop..." << std::endl;
         keepRunning = false;
+        // Senior-Expert Trick: 200ms warten, damit Integration-Tests Zeit zum Reagieren haben
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         return TRUE; 
     }
     return FALSE;
@@ -47,11 +49,16 @@ void signalHandler(int signo) {
     std::cout << "[MOCK_ORG] Linux Signal empfangen: " << signo;
     switch(signo) {
         case SIGUSR1: std::cout << " (SIGUSR1 - Custom Logic!)"; break;
+        case SIGUSR2: std::cout << " (SIGUSR2 - Custom Logic!)"; break;
         case SIGINT:  std::cout << " (SIGINT - Beende...)"; keepRunning = false; break;
         case SIGTERM: std::cout << " (SIGTERM - Beende...)"; keepRunning = false; break;
         default: std::cout << " (Anderes Signal)"; break;
     }
     std::cout << std::endl;
+    // Senior-Expert Trick: 200ms warten, damit Integration-Tests Zeit zum Reagieren haben
+    if (signo == SIGINT || signo == SIGTERM) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
 }
 #endif
 
@@ -102,6 +109,7 @@ int main(int argc, char* argv[]) {
         memset(&sa, 0, sizeof(sa));
         sa.sa_handler = signalHandler;
         sigaction(SIGUSR1, &sa, NULL);
+        sigaction(SIGUSR2, &sa, NULL);
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
 #endif
