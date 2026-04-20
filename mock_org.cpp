@@ -52,6 +52,7 @@ void signalHandler(int signo) {
         case SIGUSR2: std::cout << " (SIGUSR2 - Custom Logic!)"; break;
         case SIGINT:  std::cout << " (SIGINT - Beende...)"; keepRunning = false; break;
         case SIGTERM: std::cout << " (SIGTERM - Beende...)"; keepRunning = false; break;
+        case SIGWINCH: std::cout << " (SIGWINCH - Resize!)"; break;
         default: std::cout << " (Anderes Signal)"; break;
     }
     std::cout << std::endl;
@@ -112,6 +113,7 @@ int main(int argc, char* argv[]) {
         sigaction(SIGUSR2, &sa, NULL);
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGWINCH, &sa, NULL);
 #endif
         while (keepRunning) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

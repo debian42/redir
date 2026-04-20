@@ -605,9 +605,12 @@ public:
     }
 
     int executeChild(const fs::path& target, int argc, NativeChar** argv, const EnvMap* newEnv, const fs::path& basePath, const DebugFlags& flags) override {
-        if (flags.dumpArgs) dumpArgs(basePath, argc, argv);
-        if (flags.dumpPipes) dumpPipes(basePath);
-        if (flags.dumpSignals) dumpSignals(basePath);
+        bool enabled = isRedirEnabled();
+        if (enabled) {
+            if (flags.dumpArgs) dumpArgs(basePath, argc, argv);
+            if (flags.dumpPipes) dumpPipes(basePath);
+            if (flags.dumpSignals) dumpSignals(basePath);
+        }
 
         std::atomic<bool> ioRunning{true};
         std::thread tIn, tOut, tErr;
@@ -615,7 +618,7 @@ public:
         HANDLE hChildOutR = NULL, hChildOutW = NULL;
         HANDLE hChildErrR = NULL, hChildErrW = NULL;
 
-        if (flags.dumpIO) {
+        if (enabled && flags.dumpIO) {
             SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
             if (!CreatePipe(&hChildInR, &hChildInW, &sa, 0) ||
                 !CreatePipe(&hChildOutR, &hChildOutW, &sa, 0) ||
@@ -657,9 +660,15 @@ public:
         PROCESS_INFORMATION pi = { 0 };
 
         NativeCout.flush(); NativeCerr.flush();
+        auto closeIfValid = [](HANDLE h) { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); };
+
         if (!CreateProcessW(target.c_str(), GetCommandLineW(), 0, 0, 1, CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED, newEnv ? winEnvBlock.data() : nullptr, 0, &si, &pi)) {
             Logger::error("Start fehlgeschlagen: ", target, " (Code: ", GetLastError(), ")");
-            if (flags.dumpIO) { CloseHandle(hChildInR); CloseHandle(hChildInW); CloseHandle(hChildOutR); CloseHandle(hChildOutW); CloseHandle(hChildErrR); CloseHandle(hChildErrW); }
+            if (flags.dumpIO) {
+                closeIfValid(hChildInR); closeIfValid(hChildInW);
+                closeIfValid(hChildOutR); closeIfValid(hChildOutW);
+                closeIfValid(hChildErrR); closeIfValid(hChildErrW);
+            }
             return Constants::ERR_TARGET;
         }
         SafeHandle hProc(pi.hProcess), hThread(pi.hThread);
@@ -667,7 +676,8 @@ public:
         ResumeThread(hThread);
 
         if (flags.dumpIO) {
-            CloseHandle(hChildInR); CloseHandle(hChildOutW); CloseHandle(hChildErrW);
+            closeIfValid(hChildInR); closeIfValid(hChildOutW); closeIfValid(hChildErrW);
+
             NativeString ts = Logger::getFileTimestamp();
             NativeString pfx = basePath.stem().native() + NATIVE_TEXT("_") + std::to_wstring(GetCurrentProcessId()) + NATIVE_TEXT("_") + ts;
             
@@ -675,7 +685,7 @@ public:
             tIn = std::thread([&ioRunning, hChildInW, basePath, pfx]() {
                 IORelay::relay(std::ref(ioRunning), GetStdHandle(STD_INPUT_HANDLE), hChildInW, basePath.parent_path() / (pfx + NATIVE_TEXT("_stdin.bin")));
                 // WICHTIG: hChildInW SOFORT schließen, damit das Kind EOF sieht
-                CloseHandle(hChildInW);
+                if (hChildInW && hChildInW != INVALID_HANDLE_VALUE) CloseHandle(hChildInW);
             });
 
             tOut = std::thread(IORelay::relay, std::ref(ioRunning), hChildOutR, GetStdHandle(STD_OUTPUT_HANDLE), basePath.parent_path() / (pfx + NATIVE_TEXT("_stdout.bin")));
@@ -724,10 +734,22 @@ public:
     }
 
     PathResult getExecutablePath() override {
-        char path[1024];
-        ssize_t len = readlink("/proc/self/exe", path, sizeof(path)-1);
-        if (len != -1) { path[len] = '\0'; return { fs::path(path), Constants::SUCCESS }; }
-        return { "", Constants::ERR_INTERNAL };
+        std::string path;
+        size_t bufferSize = 1024;
+        while (true) {
+            path.resize(bufferSize);
+            ssize_t len = readlink("/proc/self/exe", path.data(), bufferSize - 1);
+            if (len != -1) {
+                if (static_cast<size_t>(len) < bufferSize - 1) {
+                    path.resize(len);
+                    return { fs::path(path), Constants::SUCCESS };
+                } else {
+                    bufferSize *= 2;
+                    continue;
+                }
+            }
+            return { "", Constants::ERR_INTERNAL };
+        }
     }
 
     EnvMap getSystemEnvironment() override {
@@ -827,6 +849,10 @@ public:
         pid_t pid = fork();
         if (pid == 0) {
             // IM KIND:
+            // 1. Erstelle eine neue Prozessgruppe, damit Terminal-Signale (Ctrl+C) nicht doppelt
+            //    am Kind ankommen. Der Wrapper fungiert nun als alleiniger Signal-Manager.
+            setpgid(0, 0);
+
             if (flags.dumpIO) {
                 dup2(pIn[0], STDIN_FILENO); close(pIn[0]); close(pIn[1]);
                 dup2(pOut[1], STDOUT_FILENO); close(pOut[0]); close(pOut[1]);
@@ -856,12 +882,14 @@ public:
                 tErr = std::thread(IORelay::relay, std::ref(ioRunning), pErr[0], STDERR_FILENO, basePath.parent_path() / (pfx + "_stderr.bin"));
             }
             
-            // Relay Handler für relevante Signale registrieren
+            // Relay Handler für relevante Signale registrieren (Dynamische Weiterleitung)
             struct sigaction sa;
             memset(&sa, 0, sizeof(sa));
             sa.sa_handler = signalRelayHandler;
-            int signalsToRelay[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2, SIGWINCH, SIGPWR, SIGALRM };
-            for (int s : signalsToRelay) sigaction(s, &sa, NULL);
+            for (int s = 1; s < NSIG; ++s) {
+                if (s == SIGCHLD) continue; 
+                sigaction(s, &sa, NULL);
+            }
             
             // Signale deblockieren, damit Handler/Wait arbeiten können
             sigprocmask(SIG_SETMASK, &oldset, NULL);
