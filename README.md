@@ -15,7 +15,7 @@
 
 ## Diagnosis & Debugging (`REDIR_DEBUG`)
 
-Diagnostic control is managed via the `REDIR_DEBUG` environment variable, which accepts a list of flags (separated by `,`, `;`, or spaces).
+Diagnostic control is managed via the `REDIR_DEBUG` environment variable, which accepts a list of flags, separated by `,`.
 
 ### Available Flags:
 
