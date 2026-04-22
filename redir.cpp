@@ -193,21 +193,24 @@ struct IORelay {
 #else
                      int src, int dst, 
 #endif
-                     const fs::path& dumpPath) {
-        std::ofstream dump(dumpPath, std::ios::binary);
+                     const fs::path& dumpPath = "") {
+        std::unique_ptr<std::ofstream> dump;
+        if (!dumpPath.empty()) {
+            dump = std::make_unique<std::ofstream>(dumpPath, std::ios::binary);
+        }
         std::vector<char> buffer(64 * 1024);
         while (running) {
 #ifdef _WIN32
             DWORD bytesRead = 0;
             if (!ReadFile(src, buffer.data(), (DWORD)buffer.size(), &bytesRead, NULL) || bytesRead == 0) break;
-            if (dump.is_open()) { dump.write(buffer.data(), bytesRead); dump.flush(); }
+            if (dump && dump->is_open()) { dump->write(buffer.data(), bytesRead); dump->flush(); }
             DWORD bytesWritten = 0;
             if (!WriteFile(dst, buffer.data(), bytesRead, &bytesWritten, NULL)) break;
 #else
             ssize_t n = read(src, buffer.data(), buffer.size());
             if (n < 0) { if (errno == EAGAIN || errno == EINTR) continue; break; }
             if (n == 0) break;
-            if (dump.is_open()) { dump.write(buffer.data(), n); dump.flush(); }
+            if (dump && dump->is_open()) { dump->write(buffer.data(), n); dump->flush(); }
             if (write(dst, buffer.data(), (size_t)n) <= 0) break;
 #endif
         }
@@ -481,7 +484,8 @@ class Win32Bridge : public IPlatformBridge {
 public:
     void setupConsole() override {
         wchar_t u16Flag[4];
-        if (GetEnvironmentVariableW(L"REDIR_ENABLE_U16TEXT", u16Flag, 4) > 0 && u16Flag[0] == L'1') {
+        DWORD res = GetEnvironmentVariableW(L"REDIR_ENABLE_U16TEXT", u16Flag, 4);
+        if (res > 0 && res < 4 && u16Flag[0] == L'1') {
             auto retVal = _setmode(_fileno(stdout), _O_U16TEXT);
             if (retVal == -1) {
                 Logger::error("Fehler beim Setzen des Modus für stdout: ", GetLastError());
@@ -499,7 +503,11 @@ public:
 
     bool isRedirEnabled() override {
         wchar_t redirFlag[4];
-        return (GetEnvironmentVariableW(L"REDIR_ENABLE_REDIR", redirFlag, 4) > 0 && redirFlag[0] == L'1');
+        DWORD res = GetEnvironmentVariableW(L"REDIR_ENABLE_REDIR", redirFlag, 4);
+        // res = 0: Variable nicht gesetzt
+        // res >= 4: Buffer zu klein (Variable länger als 3 Zeichen)
+        // res < 4 und > 0: Variable passt in Buffer
+        return (res > 0 && res < 4 && redirFlag[0] == L'1');
     }
 
     DebugFlags getDebugFlags() override {
@@ -549,6 +557,7 @@ public:
                 file.write(u8.data(), sz - 1); 
             }
         }
+        file.flush();
     }
 
     void dumpArgs(const fs::path& basePath, int, NativeChar**) override {
@@ -601,6 +610,7 @@ public:
             const char* msg = "Windows Signal Handling: Persistent log active.\n";
             DWORD written;
             WriteFile(g_sig_log_handle, msg, (DWORD)strlen(msg), &written, NULL);
+            FlushFileBuffers(g_sig_log_handle);
         }
     }
 
@@ -618,7 +628,9 @@ public:
         HANDLE hChildOutR = NULL, hChildOutW = NULL;
         HANDLE hChildErrR = NULL, hChildErrW = NULL;
 
-        if (enabled && flags.dumpIO) {
+        bool useProxyIO = enabled && flags.dumpIO;
+
+        if (useProxyIO) {
             SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
             if (!CreatePipe(&hChildInR, &hChildInW, &sa, 0) ||
                 !CreatePipe(&hChildOutR, &hChildOutW, &sa, 0) ||
@@ -651,20 +663,18 @@ public:
         SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
 
         STARTUPINFOW si = { sizeof(si) };
-        si.dwFlags |= STARTF_USESTDHANDLES;
-        if (flags.dumpIO) {
+        if (useProxyIO) {
+            si.dwFlags |= STARTF_USESTDHANDLES;
             si.hStdInput = hChildInR; si.hStdOutput = hChildOutW; si.hStdError = hChildErrW;
-        } else {
-            si.hStdInput = GetStdHandle(STD_INPUT_HANDLE); si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE); si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-        }
-        PROCESS_INFORMATION pi = { 0 };
+        } 
 
+        PROCESS_INFORMATION pi = { 0 };
         NativeCout.flush(); NativeCerr.flush();
         auto closeIfValid = [](HANDLE h) { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); };
 
         if (!CreateProcessW(target.c_str(), GetCommandLineW(), 0, 0, 1, CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED, newEnv ? winEnvBlock.data() : nullptr, 0, &si, &pi)) {
             Logger::error("Start fehlgeschlagen: ", target, " (Code: ", GetLastError(), ")");
-            if (flags.dumpIO) {
+            if (useProxyIO) {
                 closeIfValid(hChildInR); closeIfValid(hChildInW);
                 closeIfValid(hChildOutR); closeIfValid(hChildOutW);
                 closeIfValid(hChildErrR); closeIfValid(hChildErrW);
@@ -675,16 +685,14 @@ public:
         AssignProcessToJobObject(job, hProc);
         ResumeThread(hThread);
 
-        if (flags.dumpIO) {
+        if (useProxyIO) {
             closeIfValid(hChildInR); closeIfValid(hChildOutW); closeIfValid(hChildErrW);
 
             NativeString ts = Logger::getFileTimestamp();
             NativeString pfx = basePath.stem().native() + NATIVE_TEXT("_") + std::to_wstring(GetCurrentProcessId()) + NATIVE_TEXT("_") + ts;
             
-            // tIn Relay: Liest von Parent-Stdin, schreibt in hChildInW
             tIn = std::thread([&ioRunning, hChildInW, basePath, pfx]() {
                 IORelay::relay(std::ref(ioRunning), GetStdHandle(STD_INPUT_HANDLE), hChildInW, basePath.parent_path() / (pfx + NATIVE_TEXT("_stdin.bin")));
-                // WICHTIG: hChildInW SOFORT schließen, damit das Kind EOF sieht
                 if (hChildInW && hChildInW != INVALID_HANDLE_VALUE) CloseHandle(hChildInW);
             });
 
@@ -692,21 +700,15 @@ public:
             tErr = std::thread(IORelay::relay, std::ref(ioRunning), hChildErrR, GetStdHandle(STD_ERROR_HANDLE), basePath.parent_path() / (pfx + NATIVE_TEXT("_stderr.bin")));
         }
 
-        // Vater auf "Durchzug" stellen: Alle Signale ignorieren, damit das Kind sie verarbeiten kann
         (void)SetConsoleCtrlHandler(GlobalCtrlHandler, TRUE);
-        
         WaitForSingleObject(hProc, INFINITE);
 
         ioRunning = false;
         
-        if (flags.dumpIO) {
-            // Unblock tIn if it's waiting for console input
+        if (useProxyIO) {
             CancelSynchronousIo(tIn.native_handle());
-            
-            // hChildInW wird bereits im Lambda von tIn geschlossen.
             if (hChildOutR) CloseHandle(hChildOutR);
             if (hChildErrR) CloseHandle(hChildErrR);
-
             if (tIn.joinable()) tIn.join();
             if (tOut.joinable()) tOut.join();
             if (tErr.joinable()) tErr.join();
